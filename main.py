@@ -1,118 +1,91 @@
 """
 cron: 0 */6 * * *
-new Env("Linux.Do 签到")
+new Env("Linux.Do 纯 API 阅读")
 """
 
 import os
-import random
 import time
-import functools
-import sys
+import random
 import re
+from typing import List
 from loguru import logger
-from DrissionPage import ChromiumOptions, Chromium
-from tabulate import tabulate
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 
 
-def retry_decorator(retries=3):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == retries - 1:
-                        logger.error(f"函数 {func.__name__} 最终执行失败: {str(e)}")
-                    logger.warning(
-                        f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
-                    )
-                    time.sleep(1)
-            return None
+# ===================== 配置 =====================
 
-        return wrapper
-
-    return decorator
-
-
-os.environ.pop("DISPLAY", None)
-os.environ.pop("DYLD_LIBRARY_PATH", None)
-
-USERNAME = os.environ.get("LINUXDO_USERNAME") or os.environ.get("USERNAME")
-PASSWORD = os.environ.get("LINUXDO_PASSWORD") or os.environ.get("PASSWORD")
-
-BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
-    "false",
-    "0",
-    "off",
-]
-
-GOTIFY_URL = os.environ.get("GOTIFY_URL")
-GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
-SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")
-
-HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
-SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
+SESSION_URL = "https://linux.do/session"
 LATEST_URL = "https://linux.do/latest"
+CONNECT_URL = "https://connect.linux.do/"
+
+USERNAME = os.getenv("LINUXDO_USERNAME") or os.getenv("USERNAME")
+PASSWORD = os.getenv("LINUXDO_PASSWORD") or os.getenv("PASSWORD")
+
+BROWSE_TARGET = 20       # 每次最多补多少“阅读”
+MIN_READ_SEC = 15        # 每篇最小阅读时间
+MAX_READ_SEC = 45        # 每篇最大阅读时间
+
+# ===================== 工具函数 =====================
+
+def gen_ua():
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
 
 
-class LinuxDoBrowser:
-    def __init__(self) -> None:
-        from sys import platform
+def sleep_human(sec):
+    logger.info(f"模拟阅读 {sec:.1f}s")
+    time.sleep(sec)
 
-        if platform.startswith("linux"):
-            platformIdentifier = "X11; Linux x86_64"
-        elif platform == "darwin":
-            platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
-        else:
-            platformIdentifier = "Windows NT 10.0; Win64; x64"
 
-        co = (
-            ChromiumOptions()
-            .headless(True)
-            .incognito(True)
-            .set_argument("--no-sandbox")
-        )
+# ===================== 主类 =====================
 
-        co.set_user_agent(
-            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-        )
-
-        self.browser = Chromium(co)
-        self.page = self.browser.new_tab()
-
+class LinuxDoClient:
+    def __init__(self):
+        self.ua = gen_ua()
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "zh-CN,zh;q=0.9",
-            }
-        )
+        self.session.headers.update({
+            "User-Agent": self.ua,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
 
-    def login(self):
-        logger.info("开始登录")
+    # ---------- 登录 ----------
+    def login(self) -> bool:
+        logger.info("开始 API 登录流程")
 
+        # 1️⃣ 建立 session
+        self.session.get(LOGIN_URL, impersonate="chrome136")
+
+        # 2️⃣ 获取 CSRF
         headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
+        r = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
 
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
-        csrf_token = resp_csrf.json().get("csrf")
-
-        if not csrf_token:
-            logger.error("未获取到 CSRF Token")
+        if "application/json" not in r.headers.get("Content-Type", ""):
+            logger.error("CSRF 接口返回非 JSON")
+            logger.error(r.text[:300])
             return False
 
-        headers["X-CSRF-Token"] = csrf_token
-        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-        headers["Origin"] = "https://linux.do"
+        csrf = r.json().get("csrf")
+        if not csrf:
+            logger.error("CSRF 字段缺失")
+            return False
+
+        logger.success("CSRF 获取成功")
+
+        # 3️⃣ 登录
+        headers.update({
+            "X-CSRF-Token": csrf,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://linux.do",
+        })
 
         data = {
             "login": USERNAME,
@@ -121,123 +94,99 @@ class LinuxDoBrowser:
             "timezone": "Asia/Shanghai",
         }
 
-        resp_login = self.session.post(
-            SESSION_URL, data=data, headers=headers, impersonate="chrome136"
+        r = self.session.post(
+            SESSION_URL,
+            headers=headers,
+            data=data,
+            impersonate="chrome136"
         )
 
-        if resp_login.status_code != 200:
-            logger.error("登录失败")
-            return False
-
-        if resp_login.json().get("error"):
-            logger.error(f"登录错误: {resp_login.json().get('error')}")
+        if r.status_code != 200 or r.json().get("error"):
+            logger.error(f"登录失败: {r.text}")
             return False
 
         logger.success("登录成功")
-
-        # 同步 cookies
-        cookies = []
-        for k, v in self.session.cookies.get_dict().items():
-            cookies.append(
-                {"name": k, "value": v, "domain": ".linux.do", "path": "/"}
-            )
-        self.page.set.cookies(cookies)
-
-        # 🔥 关键修复：进入 latest
-        logger.info("跳转至 /latest 页面")
-        self.page.get(LATEST_URL)
-
-        if not self.page.wait.ele("@id=list-area", timeout=15):
-            logger.error("list-area 未出现，页面结构异常")
-            return False
-
-        logger.success("页面验证成功")
         return True
 
-    def click_topic(self):
-        logger.info("等待主题列表")
+    # ---------- 获取未完成的阅读数 ----------
+    def get_needed_reads(self) -> int:
+        r = self.session.get(CONNECT_URL, impersonate="chrome136")
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        if not self.page.wait.ele("@id=list-area", timeout=15):
-            logger.error("找不到 list-area")
-            return False
+        for row in soup.select("table tr"):
+            tds = row.select("td")
+            if len(tds) >= 3 and "阅读" in tds[0].text:
+                cur = int(tds[1].text.strip() or 0)
+                need = int(tds[2].text.strip() or 0)
+                logger.info(f"阅读进度 {cur}/{need}")
+                return max(0, need - cur)
 
-        topic_list = self.page.ele("@id=list-area").eles(".:title")
+        logger.warning("未找到阅读项目，默认补 0")
+        return 0
 
-        if not topic_list:
-            logger.error("未获取到任何主题")
-            return False
+    # ---------- 获取帖子列表 ----------
+    def get_topics(self, limit=30) -> List[int]:
+        r = self.session.get(LATEST_URL, impersonate="chrome136")
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        logger.info(f"获取到 {len(topic_list)} 个主题")
+        ids = []
+        for a in soup.select("a.title"):
+            m = re.search(r"/t/[^/]+/(\d+)", a.get("href", ""))
+            if m:
+                ids.append(int(m.group(1)))
 
-        for topic in random.sample(topic_list, min(10, len(topic_list))):
-            self.click_one_topic(topic.attr("href"))
+        logger.info(f"获取到 {len(ids)} 个帖子 ID")
+        return ids[:limit]
 
-        return True
+    # ---------- 模拟阅读 ----------
+    def read_topic(self, topic_id: int):
+        sec = random.uniform(MIN_READ_SEC, MAX_READ_SEC)
+        sleep_human(sec)
 
-    @retry_decorator()
-    def click_one_topic(self, url):
-        p = self.browser.new_tab()
-        p.get(url)
+        url = f"https://linux.do/topics/{topic_id}/timings"
+        data = {
+            "timings[0][topic_id]": topic_id,
+            "timings[0][total_time]": int(sec),
+        }
 
-        if random.random() < 0.3:
-            self.click_like(p)
+        r = self.session.post(
+            url,
+            data=data,
+            headers={
+                "Accept": "*/*",
+                "Referer": f"https://linux.do/t/{topic_id}",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            impersonate="chrome136"
+        )
 
-        self.browse_post(p)
-        p.close()
+        if r.status_code == 200:
+            logger.success(f"阅读计时提交成功 topic={topic_id}")
+        else:
+            logger.warning(f"阅读计时失败 topic={topic_id}")
 
-    def browse_post(self, page):
-        for _ in range(10):
-            page.run_js(f"window.scrollBy(0, {random.randint(500, 700)})")
-            time.sleep(random.uniform(2, 4))
-
-    def click_like(self, page):
-        btn = page.ele(".discourse-reactions-reaction-button")
-        if btn:
-            btn.click()
-            time.sleep(random.uniform(1, 2))
-
-    def print_connect_info(self):
-        resp = self.session.get("https://connect.linux.do/", impersonate="chrome136")
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tr")
-        data = []
-
-        for r in rows:
-            tds = r.select("td")
-            if len(tds) >= 3:
-                data.append([tds[0].text, tds[1].text or "0", tds[2].text or "0"])
-
-        print(tabulate(data, headers=["项目", "当前", "要求"], tablefmt="pretty"))
-
-    def send_notifications(self, browse):
-        msg = "✅ Linux.Do 登录成功"
-        if browse:
-            msg += " + 浏览完成"
-
-        if GOTIFY_URL and GOTIFY_TOKEN:
-            requests.post(
-                f"{GOTIFY_URL}/message",
-                params={"token": GOTIFY_TOKEN},
-                json={"title": "LINUX DO", "message": msg, "priority": 1},
-            )
-
+    # ---------- 主流程 ----------
     def run(self):
         if not self.login():
             return
 
-        self.print_connect_info()
+        need = self.get_needed_reads()
+        if need <= 0:
+            logger.success("阅读已完成，无需补充")
+            return
 
-        if BROWSE_ENABLED:
-            self.click_topic()
+        topics = self.get_topics()
+        random.shuffle(topics)
 
-        self.send_notifications(BROWSE_ENABLED)
-        self.page.close()
-        self.browser.quit()
+        for topic_id in topics[:min(need, BROWSE_TARGET)]:
+            self.read_topic(topic_id)
 
+
+# ===================== 入口 =====================
 
 if __name__ == "__main__":
     if not USERNAME or not PASSWORD:
-        print("Please set USERNAME and PASSWORD")
-        sys.exit(1)
+        logger.error("请设置 LINUXDO_USERNAME / LINUXDO_PASSWORD")
+        exit(1)
 
-    LinuxDoBrowser().run()
+    LinuxDoClient().run()
