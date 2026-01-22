@@ -1,4 +1,8 @@
 """
+# coding: utf-8
+"""
+
+"""
 cron: 0 */6 * * *
 new Env("Linux.Do 签到")
 """
@@ -14,7 +18,6 @@ from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
 from curl_cffi import requests
 from bs4 import BeautifulSoup
-
 
 def retry_decorator(retries=3):
     def decorator(func):
@@ -35,7 +38,6 @@ def retry_decorator(retries=3):
         return wrapper
 
     return decorator
-
 
 os.environ.pop("DISPLAY", None)
 os.environ.pop("DYLD_LIBRARY_PATH", None)
@@ -139,7 +141,7 @@ class LinuxDoBrowser:
         cookies = []
         for k, v in self.session.cookies.get_dict().items():
             cookies.append(
-                {"name": k, "value": v, "domain": ".linux.do", "path": "/"}
+                {"name": k, "value": v, "domain": ".linux.do", "path": ""}
             )
         self.page.set.cookies(cookies)
 
@@ -147,7 +149,7 @@ class LinuxDoBrowser:
         logger.info("跳转至 /latest 页面")
         self.page.get(LATEST_URL)
 
-        if not self.page.wait.ele("@id=list-area", timeout=15):
+        if not self.page.wait.ele_appear("@id=list-area", timeout=15):
             logger.error("list-area 未出现，页面结构异常")
             return False
 
@@ -157,7 +159,7 @@ class LinuxDoBrowser:
     def click_topic(self):
         logger.info("等待主题列表")
 
-        if not self.page.wait.ele("@id=list-area", timeout=15):
+        if not self.page.wait.ele_appear("@id=list-area", timeout=15):
             logger.error("找不到 list-area")
             return False
 
