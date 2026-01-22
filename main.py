@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 cron: 0 */6 * * *
-new Env("Linux.Do 签到")
+new Env("Linux.Do 签到 (纯浏览器版)")
 """
 
 import os
 import random
 import time
-import functools
 import sys
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
-from curl_cffi import requests
-from bs4 import BeautifulSoup
+# 仅用于通知，不用于登录
+from curl_cffi import requests 
 
 # --- 配置部分 ---
 os.environ.pop("DISPLAY", None)
@@ -33,241 +32,173 @@ GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
 
 HOME_URL = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
-SESSION_URL = "https://linux.do/session"
-CSRF_URL = "https://linux.do/session/csrf"
-LATEST_URL = "https://linux.do/latest"
-
-
-def retry_decorator(retries=3):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == retries - 1:
-                        logger.error(f"函数 {func.__name__} 最终执行失败: {str(e)}")
-                    else:
-                        logger.warning(
-                            f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
-                        )
-                        time.sleep(1)
-            return None
-        return wrapper
-    return decorator
-
+CONNECT_URL = "https://connect.linux.do/"
 
 class LinuxDoBrowser:
     def __init__(self) -> None:
-        # 1. 设置 DrissionPage 浏览器选项
+        # 1. 设置浏览器选项
         co = ChromiumOptions()
-        co.headless(True)  # 如需调试可视界面，设为 False
+        co.headless(True)  # 调试时可设为 False 观看过程
         co.incognito(True) # 无痕模式
         co.set_argument("--no-sandbox")
         co.set_argument("--disable-gpu")
-        # 禁用自动化特征，减少被检测概率
+        # 禁用自动化特征，防止被检测
         co.set_argument("--disable-blink-features=AutomationControlled")
-
+        
         # 2. 启动浏览器
         self.browser = Chromium(co)
         self.page = self.browser.latest_tab
-
-        # 3. 【关键】获取浏览器真实的 User-Agent
-        # 必须确保 requests 发出的 API 请求和浏览器完全一致，否则 session 会失效
-        self.real_ua = self.page.run_js("return navigator.userAgent")
-        logger.info(f"同步浏览器 UA: {self.real_ua[:50]}...")
-
-        # 4. 初始化 API 会话
-        self.session = requests.Session()
-        # 强制覆盖 requests 的 headers
-        self.session.headers.update({
-            "User-Agent": self.real_ua,
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Origin": "https://linux.do",
-            "Referer": "https://linux.do/"
-        })
+        
+        # 设置超时时间
+        self.page.timeout = 15
 
     def login(self):
-        logger.info("开始 API 登录流程...")
-
-        # 1. 预访问获取基础 Cookie
-        try:
-            self.session.get(HOME_URL)
-        except Exception as e:
-            logger.error(f"无法连接主页: {e}")
-            return False
-
-        # 2. 获取 CSRF Token
-        headers = {
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": LOGIN_URL,
-        }
+        logger.info("开始浏览器模拟登录...")
         
-        # 注意：这里不再使用 impersonate 参数，因为我们手动指定了完全一致的 UA
         try:
-            resp_csrf = self.session.get(CSRF_URL, headers=headers)
-            csrf_token = resp_csrf.json().get("csrf")
+            # 1. 访问登录页
+            self.page.get(LOGIN_URL)
+            
+            # 2. 等待输入框加载 (Discourse 的登录框)
+            logger.info("等待登录框加载...")
+            user_input = self.page.wait.ele("#login-account-name", timeout=15)
+            pass_input = self.page.wait.ele("#login-account-password", timeout=5)
+            
+            if not user_input or not pass_input:
+                # 某些情况下可能重定向到了首页，尝试点击首页的“登录”按钮
+                logger.warning("未直接进入登录页，尝试查找首页登录按钮")
+                login_btn = self.page.ele(".login-button")
+                if login_btn:
+                    login_btn.click()
+                    user_input = self.page.wait.ele("#login-account-name", timeout=10)
+                    pass_input = self.page.wait.ele("#login-account-password")
+            
+            if not user_input:
+                logger.error("无法找到用户名输入框")
+                return False
+
+            # 3. 输入账号密码
+            logger.info("正在输入账号密码...")
+            user_input.input(USERNAME)
+            time.sleep(0.5)
+            pass_input.input(PASSWORD)
+            time.sleep(0.5)
+
+            # 4. 点击登录按钮
+            login_btn = self.page.ele("#login-button")
+            if login_btn:
+                login_btn.click()
+                logger.info("已点击登录按钮")
+            else:
+                logger.error("未找到提交按钮")
+                return False
+
+            # 5. 验证登录结果
+            logger.info("等待登录跳转...")
+            # 等待头像出现，或者 current-user 元素
+            is_login = False
+            for _ in range(20): # 最多等待 20秒
+                time.sleep(1)
+                if self.page.ele("#current-user") or self.page.ele(".current-user") or self.page.ele("#current-user-avatar"):
+                    is_login = True
+                    break
+                # 检测是否有错误提示
+                error_alert = self.page.ele("#modal-alert")
+                if error_alert and error_alert.text:
+                    logger.error(f"登录界面提示错误: {error_alert.text}")
+                    return False
+            
+            if is_login:
+                logger.success("登录成功！")
+                return True
+            else:
+                logger.error("登录超时，未检测到登录状态")
+                # self.page.get_screenshot(path="login_timeout.png")
+                return False
+
         except Exception as e:
-            logger.error(f"获取 CSRF 失败: {e}")
+            logger.error(f"登录过程发生异常: {e}")
             return False
-
-        if not csrf_token:
-            logger.error("未获取到 CSRF Token")
-            return False
-
-        # 3. 发送登录 POST
-        headers.update({
-            "X-CSRF-Token": csrf_token,
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-        })
-
-        data = {
-            "login": USERNAME,
-            "password": PASSWORD,
-            "second_factor_method": "1",
-            "timezone": "Asia/Shanghai",
-        }
-
-        try:
-            resp_login = self.session.post(SESSION_URL, data=data, headers=headers)
-        except Exception as e:
-            logger.error(f"登录请求异常: {e}")
-            return False
-
-        if "error" in resp_login.text and "此时无法登录" in resp_login.text:
-             logger.error("IP被风控或账号异常，API返回无法登录")
-             return False
-
-        resp_json = resp_login.json()
-        if resp_json.get("error"):
-            logger.error(f"登录失败: {resp_json.get('error')}")
-            return False
-
-        logger.success("API 认证成功，正在同步 Cookie...")
-
-        # 4. 【关键】同步 Cookie 到浏览器
-        # 必须先让浏览器处于 linux.do 域名下（即使是404或未登录页）才能设置 Cookie
-        self.page.get(HOME_URL)
-
-        cookies_list = []
-        for k, v in self.session.cookies.get_dict().items():
-            cookies_list.append({
-                "name": k,
-                "value": v,
-                "domain": "linux.do", # 强制主域
-                "path": "/",          # 强制根路径
-                "secure": True
-            })
-        
-        self.page.set.cookies(cookies_list)
-
-        # 5. 跳转验证
-        logger.info("导航至 /latest...")
-        self.page.get(LATEST_URL)
-        
-        # 等待页面加载（寻找头像或当前用户标识）
-        # Discourse 登录后通常会有 current-user 的 meta 标签或 ID
-        is_login = False
-        if self.page.wait.ele("@id=current-user", timeout=10):
-            is_login = True
-        elif self.page.wait.ele(".current-user", timeout=5):
-            is_login = True
-        elif self.page.ele("#current-user-avatar"):
-            is_login = True
-
-        if not is_login:
-            # 截图调试（可选）
-            # self.page.get_screenshot(path='login_failed.jpg')
-            logger.error("Cookie 同步后验证失败：未找到登录标识")
-            return False
-
-        logger.success("浏览器登录验证通过！")
-        return True
 
     def click_topic(self):
-        logger.info("开始浏览帖子...")
+        logger.info("准备浏览帖子...")
+        
+        # 确保在首页或 Latest 页面
+        if "/latest" not in self.page.url:
+            self.page.get("https://linux.do/latest")
         
         if not self.page.wait.ele("#list-area", timeout=15):
             logger.error("列表区域未加载")
-            return False
+            return
 
-        # 模拟真人滚动
-        self.page.scroll.down(random.randint(200, 500))
+        # 模拟滚动加载
+        self.page.scroll.down(random.randint(300, 600))
+        time.sleep(2)
 
         # 获取帖子链接
-        # 选择器优化：直接找包含 href 的 title 类
         topic_links = self.page.eles("css:.title.raw-link")
-        
         if not topic_links:
             logger.warning("未找到帖子链接")
-            return False
+            return
 
-        # 去重并筛选
-        urls = list(set([t.attr("href") for t in topic_links if t.attr("href")]))
-        logger.info(f"当前页面发现 {len(urls)} 个帖子")
-
-        # 随机选取 5-8 个帖子
-        selected_urls = random.sample(urls, min(random.randint(5, 8), len(urls)))
+        # 提取链接
+        urls = []
+        for t in topic_links:
+            href = t.attr("href")
+            if href:
+                if not href.startswith("http"):
+                    href = HOME_URL.rstrip("/") + href
+                urls.append(href)
         
-        for url in selected_urls:
-            # 处理相对路径
-            if not url.startswith("http"):
-                url = HOME_URL.rstrip("/") + url
-            self.click_one_topic(url)
+        # 去重
+        urls = list(set(urls))
+        logger.info(f"发现 {len(urls)} 个帖子")
 
-        return True
-
-    @retry_decorator()
-    def click_one_topic(self, url):
-        logger.info(f"正在浏览: {url}")
+        # 随机浏览 5-8 个
+        count = 0
+        target_count = random.randint(5, 8)
         
-        # 新标签页打开
+        for url in random.sample(urls, min(target_count, len(urls))):
+            self.browse_one_post(url)
+            count += 1
+            time.sleep(random.uniform(2, 4))
+        
+        logger.success(f"浏览完成，共阅读 {count} 篇帖子")
+
+    def browse_one_post(self, url):
+        logger.info(f"正在阅读: {url}")
         tab = self.browser.new_tab()
         try:
             tab.get(url)
+            # 随机停留
+            sleep_time = random.uniform(6, 12)
             
-            # 随机停留 5-10 秒
-            sleep_time = random.uniform(5, 10)
+            # 模拟滚动
+            for _ in range(3):
+                tab.scroll.down(random.randint(200, 500))
+                time.sleep(sleep_time / 3)
             
-            # 模拟滚动阅读
-            scroll_steps = random.randint(3, 6)
-            for _ in range(scroll_steps):
-                tab.scroll.down(random.randint(200, 600))
-                time.sleep(sleep_time / scroll_steps)
-
             # 概率点赞 (20%)
             if random.random() < 0.2:
-                self.click_like(tab)
+                btn = tab.ele(".discourse-reactions-reaction-button")
+                if btn and "点赞" in btn.attr("title", ""):
+                    btn.click()
+                    logger.info("已点赞")
 
         except Exception as e:
-            logger.warning(f"浏览帖子异常: {e}")
+            logger.warning(f"阅读异常: {e}")
         finally:
             tab.close()
 
-    def click_like(self, page):
-        # Discourse 底部点赞按钮
-        try:
-            # 查找点赞按钮，注意不要点到已经点赞的（通常有点赞数的 title）
-            btn = page.ele(".discourse-reactions-reaction-button")
-            if btn and "点赞" in btn.attr("title", ""):
-                btn.click()
-                logger.info("已点赞")
-                time.sleep(1)
-        except:
-            pass
-
     def print_connect_info(self):
-        logger.info("获取 Connect 信息...")
+        logger.info("正在获取 Connect 信息...")
         try:
-            # 使用已登录的浏览器访问
-            self.page.get("https://connect.linux.do/")
+            self.page.get(CONNECT_URL)
+            # 等待表格出现
+            table = self.page.wait.ele("tag:table", timeout=15)
             
-            # 等待表格加载
-            table = self.page.wait.ele("tag:table", timeout=10)
             if not table:
-                logger.warning("未找到 Connect 数据表格")
+                logger.warning("未找到 Connect 数据表格 (可能需要手动登录 connect.linux.do 或 CF 验证)")
                 return
 
             rows = table.eles("tag:tr")
@@ -277,54 +208,53 @@ class LinuxDoBrowser:
                 if len(tds) >= 3:
                     data.append([tds[0].text, tds[1].text or "0", tds[2].text or "0"])
 
-            print(tabulate(data, headers=["项目", "当前", "要求"], tablefmt="pretty"))
-            
+            if data:
+                print(tabulate(data, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+            else:
+                logger.warning("Connect 表格为空")
+
         except Exception as e:
             logger.error(f"获取 Connect 信息失败: {e}")
 
     def send_notifications(self, browse):
-        msg = "✅ Linux.Do 签到完成"
+        msg = "✅ Linux.Do 签到脚本执行完毕"
         if browse:
             msg += " (含自动浏览)"
 
         if GOTIFY_URL and GOTIFY_TOKEN:
             try:
+                # 这里仅用于推送，可以用 requests
                 requests.post(
                     f"{GOTIFY_URL}/message",
                     params={"token": GOTIFY_TOKEN},
                     json={"title": "LINUX DO", "message": msg, "priority": 1},
-                    timeout=5
+                    timeout=10,
+                    impersonate="chrome120" # 推送时加上指纹防止 Gotify 端（如果是公网）拦截
                 )
-                logger.success("推送通知成功")
+                logger.success("通知发送成功")
             except Exception as e:
-                logger.error(f"推送通知失败: {e}")
+                logger.error(f"通知发送失败: {e}")
 
     def run(self):
-        if not self.login():
-            self.browser.quit()
-            return
-
-        # 登录成功后稍作等待
-        time.sleep(3)
+        if self.login():
+            time.sleep(2)
+            self.print_connect_info()
+            
+            if BROWSE_ENABLED:
+                self.click_topic()
+            
+            self.send_notifications(BROWSE_ENABLED)
         
-        self.print_connect_info()
-
-        if BROWSE_ENABLED:
-            self.click_topic()
-
-        self.send_notifications(BROWSE_ENABLED)
-        
-        logger.info("任务结束，关闭浏览器")
+        logger.info("关闭浏览器")
         self.browser.quit()
-
 
 if __name__ == "__main__":
     if not USERNAME or not PASSWORD:
-        logger.error("请设置 LINUXDO_USERNAME 和 LINUXDO_PASSWORD 环境变量")
+        logger.error("请设置环境变量 LINUXDO_USERNAME 和 LINUXDO_PASSWORD")
         sys.exit(1)
 
     try:
         LinuxDoBrowser().run()
     except Exception as e:
-        logger.error(f"程序运行崩溃: {e}")
+        logger.error(f"主程序崩溃: {e}")
         sys.exit(1)
