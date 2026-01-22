@@ -7,8 +7,8 @@ import os
 import time
 import random
 import re
-from loguru import logger
 from typing import Dict, List
+from loguru import logger
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 
@@ -28,18 +28,21 @@ MAX_FAIL = 5
 READ_SEGMENTS = (2, 4)
 READ_TIME = (12, 45)
 
+
 # ===================== 工具 =====================
 
-def ua():
+def gen_ua():
     return (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
+
 def human_sleep(a, b):
     t = random.uniform(a, b)
     logger.info(f"等待 {t:.1f}s")
     time.sleep(t)
+
 
 # ===================== 主类 =====================
 
@@ -47,15 +50,18 @@ class LinuxDoClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": ua(),
+            "User-Agent": gen_ua(),
             "Accept-Language": "zh-CN,zh;q=0.9",
         })
 
-    # ---------- 登录 ----------
-    def login(self):
+    # ---------- 登录（已修 JSON 防御） ----------
+    def login(self) -> bool:
         logger.info("开始登录")
+
+        # 1️⃣ 建立 session / Cloudflare cookie
         self.session.get(LOGIN_URL, impersonate="chrome136")
 
+        # 2️⃣ 获取 CSRF
         r = self.session.get(
             CSRF_URL,
             headers={
@@ -66,17 +72,31 @@ class LinuxDoClient:
             impersonate="chrome136",
         )
 
-        csrf = r.json().get("csrf")
-        if not csrf:
-            logger.error("CSRF 获取失败")
+        if "application/json" not in r.headers.get("Content-Type", ""):
+            logger.error("CSRF 接口未返回 JSON")
+            logger.error(r.text[:300])
             return False
 
+        try:
+            csrf = r.json().get("csrf")
+        except Exception as e:
+            logger.error(f"CSRF JSON 解析失败: {e}")
+            logger.error(r.text[:300])
+            return False
+
+        if not csrf:
+            logger.error("CSRF 字段缺失")
+            return False
+
+        # 3️⃣ 登录
         r = self.session.post(
             SESSION_URL,
             headers={
                 "X-CSRF-Token": csrf,
                 "Origin": "https://linux.do",
-                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": LOGIN_URL,
             },
             data={
                 "login": USERNAME,
@@ -85,10 +105,25 @@ class LinuxDoClient:
                 "timezone": "Asia/Shanghai",
             },
             impersonate="chrome136",
+            allow_redirects=False,
         )
 
-        if r.status_code != 200 or r.json().get("error"):
-            logger.error("登录失败")
+        ct = r.headers.get("Content-Type", "")
+        if "application/json" not in ct:
+            logger.error("登录接口返回非 JSON（可能被 CF / 跳转）")
+            logger.error(f"status={r.status_code}")
+            logger.error(r.text[:300])
+            return False
+
+        try:
+            data = r.json()
+        except Exception as e:
+            logger.error(f"登录 JSON 解析失败: {e}")
+            logger.error(r.text[:300])
+            return False
+
+        if data.get("error"):
+            logger.error(f"登录失败: {data.get('error')}")
             return False
 
         logger.success("登录成功")
@@ -99,7 +134,7 @@ class LinuxDoClient:
         r = self.session.get(CONNECT_URL, impersonate="chrome136")
         soup = BeautifulSoup(r.text, "html.parser")
 
-        tasks = {}
+        tasks: Dict[str, int] = {}
 
         for row in soup.select("table tr"):
             tds = row.select("td")
@@ -108,6 +143,7 @@ class LinuxDoClient:
 
             name = tds[0].text.strip().lower()
             cur, need = tds[1].text.strip(), tds[2].text.strip()
+
             if not cur.isdigit() or not need.isdigit():
                 continue
 
@@ -123,12 +159,12 @@ class LinuxDoClient:
         logger.success(f"识别 Connect 任务: {tasks}")
         return tasks
 
-    # ---------- 帖子列表 ----------
+    # ---------- 获取帖子 ----------
     def get_topics(self, limit=50) -> List[int]:
         r = self.session.get(LATEST_URL, impersonate="chrome136")
         soup = BeautifulSoup(r.text, "html.parser")
 
-        ids = []
+        ids: List[int] = []
         for a in soup.select("a.title"):
             m = re.search(r"/t/[^/]+/(\d+)", a.get("href", ""))
             if m:
@@ -138,7 +174,7 @@ class LinuxDoClient:
         return ids[:limit]
 
     # ---------- 阅读（多段 timings） ----------
-    def read_topic(self, topic_id):
+    def read_topic(self, topic_id: int) -> bool:
         segments = random.randint(*READ_SEGMENTS)
         base = random.uniform(*READ_TIME)
         times = [int(base * random.uniform(0.6, 1.0)) for _ in range(segments)]
@@ -166,7 +202,7 @@ class LinuxDoClient:
         return True
 
     # ---------- 点赞 ----------
-    def like_topic(self, topic_id):
+    def like_topic(self, topic_id: int) -> bool:
         r = self.session.post(
             "https://linux.do/post_actions",
             data={
@@ -224,7 +260,7 @@ class LinuxDoClient:
 
 if __name__ == "__main__":
     if not USERNAME or not PASSWORD:
-        logger.error("未设置账号密码")
+        logger.error("未设置 LINUXDO_USERNAME / LINUXDO_PASSWORD")
         exit(1)
 
     LinuxDoClient().run()
